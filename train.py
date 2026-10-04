@@ -1,0 +1,251 @@
+import argparse
+import io
+import logging
+import re
+from typing import Any, TypedDict
+
+import chess.pgn
+import grain.python as grain
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from datasets import load_dataset
+from jax.sharding import AxisType
+from taktiny import nn
+from taktiny.data import DataLoader, FlatMap, Pack, train_validation_split
+from taktiny.trainer import DatasetConfig, Trainer, TrainingConfig
+from taktiny.utils import map_logical_axis_names
+
+from artoria import Artoria, ArtoriaConfig
+from artoria.cache import ArtoriaCache
+from artoria.tokenizer import ArtoriaTokenizer
+
+
+class PositionEval(TypedDict):
+    fen: str
+    eval: float | str | None
+
+
+_EVAL_PATTERN = re.compile(
+    r"\[%eval\s+(?P<score>\#[+-]?\d+|[+-]?\d+(?:\.\d+)?)(?:\s*,\s*\d+)?\s*\]"
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class _StrictGameBuilder(chess.pgn.GameBuilder):
+    def handle_error(self, error: Exception) -> None:
+        raise ValueError(f"Invalid PGN: {error}") from error
+
+def moves_to_fen(data: str, train: bool = False) -> list[PositionEval]:
+    """Convert annotated PGN into positions after each mainline move.
+
+    Accepts bare movetext (as in this file) or complete PGN games, including FEN
+    starting-position headers. Multiple games are processed in input order.
+    Evaluations remain from White's perspective: numeric scores are in pawns,
+    mate scores are strings such as '#3', and missing evaluations are None.
+    Clocks, prose comments, and variations are ignored. Invalid games raise
+    ValueError rather than returning a partially parsed training sequence.
+    With train=True, fen retains piece placement, side to move, castling rights,
+    and en passant target; only the halfmove and fullmove counters are removed.
+    """
+    positions: list[PositionEval] = []
+    source = io.StringIO(data)
+    while (game := chess.pgn.read_game(source, Visitor=_StrictGameBuilder)) is not None:
+        if game.errors:
+            raise ValueError(f"Invalid PGN: {game.errors[0]}") from game.errors[0]
+        board = game.board()
+        for node in game.mainline():
+            board.push(node.move)
+            match = _EVAL_PATTERN.search(node.comment)
+            score = match.group("score") if match else None
+            evaluation = (
+                float(score) if score is not None and not score.startswith("#") else score
+            )
+            fen = board.fen(en_passant="fen")
+            if train:
+                fen = " ".join(fen.split()[:4])
+            positions.append({"fen": fen, "eval": evaluation})
+    return positions
+
+
+def tokenize_game(row: dict[str, Any]) -> list[dict[str, np.ndarray]]:
+    """Emit one encoded game, or skip a malformed/unsupported game with a warning.
+
+    Keep every position in valid games. Only finite pawn evaluations contribute
+    to the regression loss; missing and mate annotations have eval_mask=0.
+    """
+    identity = row.get("GameURL") or row.get("Site") or "unknown game"
+    variant = row.get("Variant")
+    if variant and variant.lower() not in ("standard", "chess", "normal"):
+        _LOGGER.warning("Skipping %s: unsupported variant %s", identity, variant)
+        return []
+    movetext = row["movetext"]
+    if row.get("FEN"):
+        # Restore starting-position metadata when stored separately from movetext.
+        starting_fen = row["FEN"]
+        movetext = f'[SetUp "1"]\n[FEN "{starting_fen}"]\n\n{movetext}'
+    try:
+        positions = moves_to_fen(movetext, train=True)
+        if not positions:
+            return []
+        tokens = ArtoriaTokenizer().encode([p["fen"] for p in positions])[0]
+    except ValueError as error:
+        _LOGGER.warning("Skipping %s: %s; movetext begins %r", identity, error, row["movetext"][:160])
+        return []
+    scores = np.zeros(len(positions), dtype=np.float32)
+    score_mask = np.zeros(len(positions), dtype=np.int32)
+    for index, position in enumerate(positions):
+        score = position["eval"]
+        if isinstance(score, (int, float)) and np.isfinite(score):
+            scores[index] = score
+            score_mask[index] = 1
+    return [{"fen_ids": tokens, "eval": scores, "eval_mask": score_mask}]
+
+
+def training_loss(model, batch):
+    fen_ids = batch["fen_ids"]
+    position_ids = batch["position_ids"]
+    segment_ids = jnp.cumsum(position_ids == 0, axis=-1) - 1
+    same_game = segment_ids[..., :, None] == segment_ids[..., None, :]
+    mask = jnp.tril(same_game)[:, None, ...]
+    logits, ev_logits = model(fen_ids, mask, position_ids)
+    token_loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits[:, :-1].astype(jnp.float32), fen_ids[:, 1:]
+    )
+    # Do not learn a next-position target across packed game boundaries.
+    next_mask = (position_ids[:, 1:] == position_ids[:, :-1] + 1)[..., None]
+    token_count = jnp.maximum(next_mask.sum() * fen_ids.shape[-1], 1)
+    token_loss = jnp.where(next_mask, token_loss, 0).sum() / token_count
+    # The current model emits an evaluation for each slot; reduce to one per board.
+    predictions = ev_logits.squeeze(-1).mean(axis=-1)
+    eval_loss = optax.huber_loss(predictions, batch["eval"], delta=0.3)
+    eval_mask = batch["eval_mask"].astype(bool)
+    eval_loss = jnp.where(eval_mask, eval_loss, 0).sum() / jnp.maximum(eval_mask.sum(), 1)
+    return token_loss + 0.1 * eval_loss
+
+def process_dataset(repo: str, max_len: int, batch_size: int, workers: int):
+    ds = load_dataset(repo, split='train')
+    train, val = train_validation_split(ds, 0.01)
+
+    train_loader = DataLoader(
+        train, 
+        operations=[
+            FlatMap(tokenize_game, max_fan_out=1),
+            Pack(max_len, keys=('fen_ids', 'eval', 'eval_mask'), position_key='position_ids', drop_remainder=True)
+        ],
+        worker_buffer_size=2,
+        worker_count=workers,
+        read_options=grain.ReadOptions(
+            num_threads=0,
+            prefetch_buffer_size=0,
+        ),
+        axis_names={
+            'fen_ids': ('batch', 'sequence', 'board'),
+            'eval': ('batch', 'sequence'),
+            'eval_mask': ('batch', 'sequence'),
+            'position_ids': ('batch', 'sequence'),
+        },
+        batch_size=batch_size,
+        drop_remainder=True,
+    )
+    val_loader = DataLoader(
+        val, 
+        operations=[
+            FlatMap(tokenize_game, max_fan_out=1),
+            Pack(max_len, keys=('fen_ids', 'eval', 'eval_mask'), position_key='position_ids', drop_remainder=True)
+        ],
+        worker_buffer_size=2,
+        worker_count=workers,
+        read_options=grain.ReadOptions(
+            num_threads=0,
+            prefetch_buffer_size=0,
+        ),
+        axis_names={
+            'fen_ids': ('batch', 'sequence', 'board'),
+            'eval': ('batch', 'sequence'),
+            'eval_mask': ('batch', 'sequence'),
+            'position_ids': ('batch', 'sequence'),
+        },
+        batch_size=batch_size,
+        drop_remainder=True,
+    )
+
+    return train_loader, val_loader
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    # data
+    parser.add_argument('--data-repo', type=str, default='Lichess/tournament-chess-games')
+    parser.add_argument('--eval', action='store_true')
+    parser.add_argument('--max-seq-len', type=int, default=128)
+
+    # train
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--warmup', type=int, default=10)
+    parser.add_argument('--max-steps', type=int, default=100)
+    parser.add_argument('--batch-size', type=int, default=1)
+    parser.add_argument('--wd', type=float, default=0.0)
+    parser.add_argument('--log-interval', type=int, default=10)
+    parser.add_argument('--out-dir', type=str, default='out')
+    parser.add_argument('--loss-chunk-size', type=int, default=128)
+    
+    # other
+    parser.add_argument('--workers', type=int, default=0)
+    parser.add_argument('--not-save', action='store_false', default=True) # debug
+
+    args = parser.parse_args()
+    if args.loss_chunk_size < 1:
+        parser.error('--loss-chunk-size must be positive')
+
+    mesh = jax.make_mesh(
+        (1, jax.device_count()), 
+        ('model', 'data'), 
+        (AxisType.Auto, AxisType.Auto)
+    )
+    jax.set_mesh(mesh)
+    map_logical_axis_names({
+        'vocab': None,
+        'hidden': 'model',
+        'num_heads': None,
+        'head_dim': None,
+        'intermediate': None,
+        'batch': 'data',
+        'sequence': None,
+    })
+
+    train_loader, val_loader = process_dataset(
+        args.data_repo, 
+        args.max_seq_len, 
+        args.batch_size, 
+        args.workers, 
+    )
+
+    config = ArtoriaConfig()
+    schedule = optax.cosine_decay_schedule(args.lr, args.max_steps)
+    optimizer = optax.adamw(schedule, weight_decay=args.wd)
+
+    model = Artoria(config, rngs=nn.Rngs(0))
+    trainer = Trainer(
+        model,
+        TrainingConfig(
+            max_steps=args.max_steps,
+            schedule=schedule,
+            optimizer=optimizer,
+            eval_strategy='steps' if args.eval else 'no',
+            eval_steps=args.max_steps // 4 if args.max_steps > 10 else args.max_steps,
+            output_dir=f'{args.out_dir}',
+            save_at_end=args.not_save,
+            log_interval=args.log_interval,
+        ),
+        DatasetConfig(
+            train_loader,
+            val_loader
+        ),
+        loss_fn=training_loss,
+    )
+
+    trainer.train()
