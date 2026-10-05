@@ -10,6 +10,7 @@ from taktiny.data import DataLoader, FlatMap, Pack
 from datasets import Dataset
 
 from train import filter_training_games, is_trainable_game, process_dataset, tokenize_game, training_loss
+from artoria.moves import move_to_id, NUM_MOVES
 
 
 class TrainingPipelineTests(unittest.TestCase):
@@ -77,18 +78,21 @@ class TrainingPipelineTests(unittest.TestCase):
         self.assertIn("bad-game", logs.output[0])
         self.assertIn("Nd3", logs.output[0])
         row = tokenize_game(good)[0]
-        self.assertEqual(row["fen_ids"].shape, (2, 70))
-        np.testing.assert_allclose(row["eval"], [0.25, -0.1])
+        self.assertEqual(row["fen_ids"].shape, (3, 70))
+        np.testing.assert_allclose(row["eval"], [0, 0.25, -0.1])
+        np.testing.assert_array_equal(row['policy_ids'], [move_to_id('e2e4'), move_to_id('e7e5'), 0])
+        np.testing.assert_array_equal(row['policy_mask'], [1, 1, 0])
 
     def test_metadata_and_non_numeric_evaluations(self):
         row = tokenize_game({
             "FEN": "7k/P7/8/8/8/8/8/7K w - - 0 1", "Variant": "Standard",
             "movetext": "1. a8=Q+ { [%eval #3] } Kh7 *",
         })[0]
-        self.assertEqual(row["fen_ids"][0, 0], 4)
+        self.assertEqual(row["fen_ids"][1, 0], 4)
         self.assertEqual(row["eval"].dtype, np.float32)
-        np.testing.assert_array_equal(row["eval_mask"], [0, 0])
-        np.testing.assert_array_equal(row["eval"], [0, 0])
+        np.testing.assert_array_equal(row["eval_mask"], [0, 0, 0])
+        np.testing.assert_array_equal(row["eval"], [0, 0, 0])
+        self.assertEqual(row['policy_ids'][0], move_to_id('a7a8q'))
         with self.assertLogs("train", level="WARNING"):
             self.assertEqual(tokenize_game({"Variant": "Atomic", "movetext": "1. e4 *"}), [])
 
@@ -100,33 +104,44 @@ class TrainingPipelineTests(unittest.TestCase):
         ]
         loader = DataLoader(rows, operations=[
             FlatMap(tokenize_game, max_fan_out=1),
-            Pack(5, keys=("fen_ids", "eval", "eval_mask"), position_key="position_ids"),
+            Pack(7, keys=("fen_ids", "eval", "eval_mask", 'policy_ids', 'policy_mask'), position_key="position_ids"),
         ], worker_count=0, batch_size=1)
         with self.assertLogs("train", level="WARNING"):
             batch = next(iter(loader))
-        self.assertEqual(batch["fen_ids"].shape, (1, 5, 70))
-        np.testing.assert_allclose(batch["eval"], [[0.2, -0.1, 0.3, 0, 0]])
-        np.testing.assert_array_equal(batch["eval_mask"], [[1, 1, 1, 0, 0]])
-        np.testing.assert_array_equal(batch["position_ids"], [[0, 1, 0, 1, 2]])
+        self.assertEqual(batch["fen_ids"].shape, (1, 7, 70))
+        np.testing.assert_allclose(batch["eval"], [[0, 0.2, -0.1, 0, 0.3, 0, 0]])
+        np.testing.assert_array_equal(batch["eval_mask"], [[0, 1, 1, 0, 1, 0, 0]])
+        np.testing.assert_array_equal(batch["position_ids"], [[0, 1, 2, 0, 1, 2, 3]])
+        np.testing.assert_array_equal(batch['policy_mask'], [[1, 1, 0, 1, 1, 1, 0]])
 
     def test_loss_uses_integer_labels_and_masks_game_boundaries(self):
         def model(ids, mask, positions):
             # Only transition 0->1 is a training target; the next game starts at 2.
             logits = jnp.zeros((*ids.shape, 26)).at[:, 1].set(100 * jax.nn.one_hot(ids[:, 1], 26))
             predictions = jnp.ones((*ids.shape[:2], 1))
-            return logits, predictions
+            return logits, predictions, jnp.zeros((*ids.shape[:2], NUM_MOVES))
 
         batch = {
             "fen_ids": jnp.zeros((1, 3, 70), dtype=jnp.int32),
             "position_ids": jnp.array([[0, 1, 0]]),
             "eval": jnp.array([[1., 100., -100.]]),
             "eval_mask": jnp.array([[1, 0, 0]]),
+            'policy_ids': jnp.zeros((1, 3), dtype=jnp.int32),
+            'policy_mask': jnp.array([[1, 0, 0]]),
         }
         actual = jax.jit(lambda b: training_loss(model, b))(batch)
-        self.assertAlmostEqual(float(actual), float(np.log(26)), places=5)
+        self.assertAlmostEqual(float(actual), float(np.log(26) + np.log(NUM_MOVES)), places=5)
         batch["position_ids"] = jnp.zeros((1, 3), dtype=jnp.int32)
         batch["eval_mask"] = jnp.zeros((1, 3), dtype=jnp.int32)
+        batch['policy_mask'] = jnp.zeros((1, 3), dtype=jnp.int32)
         self.assertEqual(float(training_loss(model, batch)), 0.0)
+
+    def test_multiple_games_keep_separate_policy_sequences(self):
+        games = tokenize_game({'movetext': '1. e4 *\n\n1. d4 d5 *'})
+        self.assertEqual([len(g['fen_ids']) for g in games], [2, 3])
+        self.assertEqual(games[0]['policy_ids'][0], move_to_id('e2e4'))
+        self.assertEqual(games[1]['policy_ids'][0], move_to_id('d2d4'))
+        self.assertTrue(all(g['policy_mask'][-1] == 0 for g in games))
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ import io
 import logging
 import os
 import re
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 import chess.pgn
 import grain.python as grain
@@ -21,11 +21,13 @@ from taktiny.utils import map_logical_axis_names
 from artoria import Artoria, ArtoriaConfig
 from artoria.cache import ArtoriaCache  # noqa: F401
 from artoria.tokenizer import ArtoriaTokenizer
+from artoria.moves import move_to_id
 
 
 class PositionEval(TypedDict):
     fen: str
     eval: float | str | None
+    next_move: NotRequired[str | None]
 
 
 _EVAL_PATTERN = re.compile(
@@ -39,7 +41,7 @@ class _StrictGameBuilder(chess.pgn.GameBuilder):
     def handle_error(self, error: Exception) -> None:
         raise ValueError(f"Invalid PGN: {error}") from error
 
-def moves_to_fen(data: str, train: bool = False) -> list[PositionEval]:
+def moves_to_fen(data: str, train: bool = False, *, policy: bool = False) -> list[PositionEval]:
     """Convert annotated PGN into positions after each mainline move.
 
     Accepts bare movetext (as in this file) or complete PGN games, including FEN
@@ -50,6 +52,8 @@ def moves_to_fen(data: str, train: bool = False) -> list[PositionEval]:
     ValueError rather than returning a partially parsed training sequence.
     With train=True, fen retains piece placement, side to move, castling rights,
     and en passant target; only the halfmove and fullmove counters are removed.
+    With policy=True, include each game's starting board and attach its next
+    UCI move to every position. Final positions have next_move=None.
     """
     positions: list[PositionEval] = []
     source = io.StringIO(data)
@@ -57,7 +61,12 @@ def moves_to_fen(data: str, train: bool = False) -> list[PositionEval]:
         if game.errors:
             raise ValueError(f"Invalid PGN: {game.errors[0]}") from game.errors[0]
         board = game.board()
-        for node in game.mainline():
+        nodes = list(game.mainline())
+        if policy and nodes:
+            fen = board.fen(en_passant='fen')
+            positions.append({'fen': ' '.join(fen.split()[:4]) if train else fen,
+                              'eval': None, 'next_move': nodes[0].move.uci()})
+        for index, node in enumerate(nodes):
             board.push(node.move)
             match = _EVAL_PATTERN.search(node.comment)
             score = match.group("score") if match else None
@@ -67,15 +76,18 @@ def moves_to_fen(data: str, train: bool = False) -> list[PositionEval]:
             fen = board.fen(en_passant="fen")
             if train:
                 fen = " ".join(fen.split()[:4])
-            positions.append({"fen": fen, "eval": evaluation})
+            position: PositionEval = {"fen": fen, "eval": evaluation}
+            if policy:
+                position['next_move'] = nodes[index + 1].move.uci() if index + 1 < len(nodes) else None
+            positions.append(position)
     return positions
 
 
 def tokenize_game(row: dict[str, Any], *, warn: bool = True) -> list[dict[str, Any]]:
-    """Emit one encoded game, or skip a malformed/unsupported game with a warning.
+    """Emit encoded games, or skip a malformed/unsupported record with a warning.
 
-    Keep every position in valid games. Only finite pawn evaluations contribute
-    to the regression loss; missing and mate annotations have eval_mask=0.
+    Include starting boards and aligned next-move labels. Only finite pawn
+    evaluations contribute to regression; missing/mate scores have eval_mask=0.
     """
     identity = row.get("GameURL") or row.get("Site") or "unknown game"
     variant = row.get("Variant")
@@ -89,22 +101,35 @@ def tokenize_game(row: dict[str, Any], *, warn: bool = True) -> list[dict[str, A
         starting_fen = row["FEN"]
         movetext = f'[SetUp "1"]\n[FEN "{starting_fen}"]\n\n{movetext}'
     try:
-        positions = moves_to_fen(movetext, train=True)
+        positions = moves_to_fen(movetext, train=True, policy=True)
         if not positions:
             return []
-        tokens = ArtoriaTokenizer().encode([p["fen"] for p in positions])[0]
     except ValueError as error:
         if warn:
             _LOGGER.warning("Skipping %s: %s; movetext begins %r", identity, error, row["movetext"][:160])
         return []
-    scores = np.zeros(len(positions), dtype=np.float32)
-    score_mask = np.zeros(len(positions), dtype=np.int32)
-    for index, position in enumerate(positions):
-        score = position["eval"]
-        if isinstance(score, (int, float)) and np.isfinite(score):
-            scores[index] = score
-            score_mask[index] = 1
-    return [{"fen_ids": tokens, "eval": scores, "eval_mask": score_mask}]
+    games, start = [], 0
+    for end, position in enumerate(positions):
+        if position['next_move'] is not None:
+            continue
+        game = positions[start:end + 1]
+        start = end + 1
+        scores = np.zeros(len(game), dtype=np.float32)
+        score_mask = np.zeros(len(game), dtype=np.int32)
+        policy_ids = np.zeros(len(game), dtype=np.int32)
+        policy_mask = np.zeros(len(game), dtype=np.int32)
+        for index, pos in enumerate(game):
+            score = pos['eval']
+            if isinstance(score, (int, float)) and np.isfinite(score):
+                scores[index], score_mask[index] = score, 1
+            if pos['next_move'] is not None:
+                policy_ids[index], policy_mask[index] = move_to_id(pos['next_move']), 1
+        tokens = ArtoriaTokenizer().encode([p['fen'] for p in game])[0]
+        games.append({'fen_ids': tokens, 'eval': scores, 'eval_mask': score_mask,
+                      'policy_ids': policy_ids, 'policy_mask': policy_mask})
+    if len(games) > 64:
+        raise ValueError('A dataset record may contain at most 64 games.')
+    return games
 
 
 class _GameValidator(chess.pgn.BaseVisitor[bool]):
@@ -181,7 +206,7 @@ def training_loss(model, batch):
     segment_ids = jnp.cumsum(position_ids == 0, axis=-1) - 1
     same_game = segment_ids[..., :, None] == segment_ids[..., None, :]
     mask = jnp.tril(same_game)[:, None, ...]
-    logits, ev_logits = model(fen_ids, mask, position_ids)
+    logits, ev_logits, policy_logits = model(fen_ids, mask, position_ids)
     token_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits[:, :-1].astype(jnp.float32), fen_ids[:, 1:]
     )
@@ -193,7 +218,11 @@ def training_loss(model, batch):
     eval_loss = optax.huber_loss(predictions, batch["eval"], delta=0.3)
     eval_mask = batch["eval_mask"].astype(bool)
     eval_loss = jnp.where(eval_mask, eval_loss, 0).sum() / jnp.maximum(eval_mask.sum(), 1)
-    return token_loss + 0.1 * eval_loss
+    policy_loss = optax.softmax_cross_entropy_with_integer_labels(
+        policy_logits.astype(jnp.float32), batch['policy_ids'])
+    policy_mask = batch['policy_mask'].astype(bool)
+    policy_loss = jnp.where(policy_mask, policy_loss, 0).sum() / jnp.maximum(policy_mask.sum(), 1)
+    return policy_loss + token_loss + 0.1 * eval_loss
 
 def process_dataset(repo: str, max_len: int, batch_size: int, workers: int, filter_workers: int = 1):
     ds = load_dataset(repo, split='train')
@@ -203,8 +232,8 @@ def process_dataset(repo: str, max_len: int, batch_size: int, workers: int, filt
     train_loader = DataLoader(
         train, 
         operations=[
-            FlatMap(tokenize_game, max_fan_out=1),
-            Pack(max_len, keys=('fen_ids', 'eval', 'eval_mask'), position_key='position_ids', drop_remainder=True)
+            FlatMap(tokenize_game, max_fan_out=64),
+            Pack(max_len, keys=('fen_ids', 'eval', 'eval_mask', 'policy_ids', 'policy_mask'), position_key='position_ids', drop_remainder=True)
         ],
         worker_buffer_size=2,
         worker_count=workers,
@@ -216,6 +245,8 @@ def process_dataset(repo: str, max_len: int, batch_size: int, workers: int, filt
             'fen_ids': ('batch', 'sequence', 'board'),
             'eval': ('batch', 'sequence'),
             'eval_mask': ('batch', 'sequence'),
+            'policy_ids': ('batch', 'sequence'),
+            'policy_mask': ('batch', 'sequence'),
             'position_ids': ('batch', 'sequence'),
         },
         batch_size=batch_size,
@@ -224,8 +255,8 @@ def process_dataset(repo: str, max_len: int, batch_size: int, workers: int, filt
     val_loader = DataLoader(
         val, 
         operations=[
-            FlatMap(tokenize_game, max_fan_out=1),
-            Pack(max_len, keys=('fen_ids', 'eval', 'eval_mask'), position_key='position_ids', drop_remainder=True)
+            FlatMap(tokenize_game, max_fan_out=64),
+            Pack(max_len, keys=('fen_ids', 'eval', 'eval_mask', 'policy_ids', 'policy_mask'), position_key='position_ids', drop_remainder=True)
         ],
         worker_buffer_size=2,
         worker_count=workers,
@@ -237,6 +268,8 @@ def process_dataset(repo: str, max_len: int, batch_size: int, workers: int, filt
             'fen_ids': ('batch', 'sequence', 'board'),
             'eval': ('batch', 'sequence'),
             'eval_mask': ('batch', 'sequence'),
+            'policy_ids': ('batch', 'sequence'),
+            'policy_mask': ('batch', 'sequence'),
             'position_ids': ('batch', 'sequence'),
         },
         batch_size=batch_size,

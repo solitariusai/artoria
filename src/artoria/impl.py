@@ -140,7 +140,8 @@ class ArtoriaDecoder(nn.Module):
 class Artoria(nn.Module):
     """Spatial board encoding -> mean pooling -> temporal game decoding.
 
-    Token logits are [B, T, 70, vocab]; pawn evaluations are [B, T, 1].
+    Returns board logits [B,T,70,vocab], evaluations [B,T,1],
+    and next-move policy logits [B,T,n_moves].
     """
     def __init__(self, config: ArtoriaConfig, *, rngs: nn.Rngs):
         self.wte = nn.Embedding(config.vocab, config.d_model, dtype=config.dtype, rngs=rngs, axis_names=('vocab', 'embed'))
@@ -155,6 +156,7 @@ class Artoria(nn.Module):
         self.eval_norm = nn.RMSNorm(config.d_model, config.epsilon, dtype='float32', axis_names=('embed',))
         self.head = nn.Linear(config.d_model, (70, config.vocab), bias=False, dtype=config.dtype, rngs=rngs, axis_names=('embed', 'slot', 'vocab'))
         self.eval_head = nn.Linear(config.d_model, 1, bias=True, dtype='float32', rngs=rngs, axis_names=('embed', 'eval'))
+        self.policy_head = nn.Linear(config.d_model, config.n_moves, bias=False, dtype=config.dtype, rngs=rngs, axis_names=('embed', 'move'))
         self.rope = ArtoriaRoPE(config.head_dim)
         self.files = nn.Parameter( 0.02 * jax.random.normal(rngs(), (8, config.d_model)))
         self.ranks = nn.Parameter( 0.02 * jax.random.normal(rngs(), (8, config.d_model)))
@@ -167,7 +169,7 @@ class Artoria(nn.Module):
         mask: jax.Array | None = None,
         position_ids: jax.Array | None = None, 
         cache: ArtoriaCache | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         # ids: [B, T, 70] -> [B, T, 70, C]
         if ids.ndim != 3 or ids.shape[-1] != 70:
             raise ValueError('ids must have shape [batch, sequence, 70]')
@@ -210,11 +212,12 @@ class Artoria(nn.Module):
 
         ev = jax.checkpoint(self.eval_norm)(x)
         ev_logits = jax.checkpoint(self.eval_head)(ev)
+        policy_logits = jax.checkpoint(self.policy_head)(x)
 
         if cache is not None:
             cache.advance(logits.shape[1])
             
-        return logits, ev_logits
+        return logits, ev_logits, policy_logits
 
 
 __all__ = ['Artoria']

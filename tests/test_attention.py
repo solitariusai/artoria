@@ -64,6 +64,8 @@ class AttentionShapeTests(unittest.TestCase):
             "position_ids": jnp.array([[0, 1, 2], [0, 1, 0]]),
             "eval": jnp.array([[0.2, 0.1, 0.0], [-0.1, 0.2, 0.3]]),
             "eval_mask": jnp.ones((2, 3), dtype=jnp.int32),
+            'policy_ids': jnp.zeros((2, 3), dtype=jnp.int32),
+            'policy_mask': jnp.ones((2, 3), dtype=jnp.int32),
         }
         loss, gradients = jax.jit(jax.value_and_grad(
             lambda parameters: training_loss(_combine_params(parameters, frozen), batch)
@@ -73,15 +75,16 @@ class AttentionShapeTests(unittest.TestCase):
             self.assertTrue(np.isfinite(np.asarray(leaf)).all())
         self.assertGreater(float(jnp.linalg.norm(gradients.ranks.value)), 0)
         self.assertGreater(float(jnp.linalg.norm(gradients.files.value)), 0)
+        self.assertGreater(float(jnp.linalg.norm(gradients.policy_head.kernel.value)), 0)
 
     def test_pooled_temporal_cache_matches_full_causal_forward(self):
         model = Artoria(self.config, rngs=nn.Rngs(3))
         ids = jnp.arange(2 * 4 * 70).reshape(2, 4, 70) % 26
-        full_logits, full_eval = model(ids)
+        full_outputs = model(ids)
         cache = ArtoriaCache(self.config, num_batches=2, max_sequences=4)
         first = model(ids[:, :2], cache=cache)
         second = model(ids[:, 2:], cache=cache)
-        for expected, before, after in zip((full_logits, full_eval), first, second):
+        for expected, before, after in zip(full_outputs, first, second):
             actual = jnp.concatenate((before, after), axis=1)
             np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
         self.assertEqual(int(cache.position_idx[...]), 4)
