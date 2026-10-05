@@ -189,7 +189,7 @@ class Artoria(nn.Module):
         x = x + slot_positions.astype(x.dtype)[None, None]
         x = x.reshape(B * T, S, C)
         for spatial_layer in self.spatial_layers:
-            x = spatial_layer(x)
+            x = jax.checkpoint(spatial_layer)(x)
         x = x.mean(axis=1).reshape(B, T, C)
         if mask is None and cache is None:
             mask = jnp.tril(jnp.ones((T, T), dtype=bool))[None, None]

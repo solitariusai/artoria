@@ -10,9 +10,9 @@ class ArtoriaConfig:
     n_depth: int = 4
     n_spatial_layers: int = 1
     epsilon: float = 1e-7
-    n_heads: int = 12
-    n_kv_heads: int = 12
-    head_dim: int = 64
+    n_heads: int = 6
+    n_kv_heads: int = 6
+    head_dim: int = 16
     dtype: str = 'bfloat16'
 
 
