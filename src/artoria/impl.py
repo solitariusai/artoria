@@ -146,7 +146,7 @@ class ArtoriaDecoder(nn.Module):
 class Artoria(nn.Module):
     def __init__(self, config: ArtoriaConfig, *, rngs: nn.Rngs):
         self.wte = nn.Embedding(config.vocab, config.d_model, dtype=config.dtype, rngs=rngs, axis_names=('vocab', 'embed'))
-        self.layers = nn.SeqStack([
+        self.layers = nn.List([
             nn.SeqStack([ArtoriaDecoder(config, rngs=rngs) for _ in range(config.n_parallel)])
             for _ in range(config.n_depth)
         ])
@@ -177,23 +177,20 @@ class Artoria(nn.Module):
             position_ids = start_idx + jnp.arange(x.shape[1])
 
         position_embedding = self.rope(position_ids)
-        layer_idx = jax.new_ref(jnp.asarray(0, dtype='uint32'))
+        layer_idx = jnp.asarray(0, dtype='uint32')
 
         coord = (self.ranks[:, None, :] + self.files[None, :, :]).reshape(64, -1)
-        x = jax.new_ref(x)
-        x[..., :64, :] += (coord).astype(x.dtype)
-        x = x[...]
-        def fwd_layer_inner(layer, x, z, layer_idx):
-            x = jax.checkpoint(layer)(z, mask, position_embedding, cache, layer_idx[...]) + x
-            layer_idx[...] += 1
-            return x, None
-        
-        def fwd_layer(layer, x, layer_idx):
+        x = x.at[..., :64, :].add(coord.astype(x.dtype))
+        def fwd_layer(layer, carry, z):
+            x, layer_idx = carry
+            x = jax.checkpoint(layer)(z, mask, position_embedding, cache, layer_idx) + x
+            return (x, layer_idx + 1), None
+
+        for layer in self.layers:
             z = x
-            x, _ = layer(fwd_layer_inner, x, z, layer_idx)
-            return x / self.k, None
-            
-        x, _ = self.layers(fwd_layer, x, layer_idx)
+            (x, layer_idx), _ = jax.checkpoint(layer, static_argnums=0)(fwd_layer, (x, layer_idx), z)
+            x = x / self.k
+
         x = jax.checkpoint(self.norm)(x)
         logits = jax.checkpoint(self.head)(x)
 

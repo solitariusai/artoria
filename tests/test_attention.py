@@ -8,6 +8,8 @@ from taktiny import nn
 from artoria import Artoria, ArtoriaConfig
 from artoria.impl import ArtoriaAttention
 from artoria.rope import ArtoriaRoPE
+from taktiny.utils.trainer import _combine_params, _parameter_labels, _partition_params
+from train import training_loss
 
 
 class AttentionShapeTests(unittest.TestCase):
@@ -50,6 +52,26 @@ class AttentionShapeTests(unittest.TestCase):
         np.testing.assert_allclose(original[:, :3], future_changed[:, :3], rtol=2e-5, atol=2e-5)
         earlier_game_changed = model(ids.at[1, :2].set(12), mask, positions)[0]
         np.testing.assert_allclose(original[1, 2:], earlier_game_changed[1, 2:], rtol=2e-5, atol=2e-5)
+
+    def test_checkpointed_nested_stacks_support_training_gradients(self):
+        self.config.n_depth = 2
+        self.config.n_parallel = 2
+        model = Artoria(self.config, rngs=nn.Rngs(2))
+        trainable, frozen = _partition_params(model, _parameter_labels(model))
+        batch = {
+            "fen_ids": jnp.arange(2 * 3 * 70).reshape(2, 3, 70) % 26,
+            "position_ids": jnp.array([[0, 1, 2], [0, 1, 0]]),
+            "eval": jnp.array([[0.2, 0.1, 0.0], [-0.1, 0.2, 0.3]]),
+            "eval_mask": jnp.ones((2, 3), dtype=jnp.int32),
+        }
+        loss, gradients = jax.jit(jax.value_and_grad(
+            lambda parameters: training_loss(_combine_params(parameters, frozen), batch)
+        ))(trainable)
+        self.assertTrue(np.isfinite(float(loss)))
+        for leaf in jax.tree.leaves(gradients):
+            self.assertTrue(np.isfinite(np.asarray(leaf)).all())
+        self.assertGreater(float(jnp.linalg.norm(gradients.ranks.value)), 0)
+        self.assertGreater(float(jnp.linalg.norm(gradients.files.value)), 0)
 
 
 if __name__ == "__main__":
