@@ -1,14 +1,74 @@
 import unittest
+from unittest.mock import patch
+import io
+from contextlib import redirect_stdout
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from taktiny.data import DataLoader, FlatMap, Pack
+from datasets import Dataset
 
-from train import tokenize_game, training_loss
+from train import filter_training_games, is_trainable_game, process_dataset, tokenize_game, training_loss
 
 
 class TrainingPipelineTests(unittest.TestCase):
+    def test_fast_validator_matches_full_conversion(self):
+        rows = [
+            {"movetext": "1. e4 { [%eval 0.2] } e5 (1... c5) 2. Nf3 *"},
+            {"movetext": "1. e4 (1. Bh6) e5 *"},  # Illegal variation also rejects the game.
+            {"movetext": "1. e4 e5 2. Bh6 *"},
+            {"movetext": "*"},
+            {"movetext": ""},
+            {"movetext": "1. d4 *\n\n1. e4 e5 2. Bh6 *"},
+            {"movetext": "1. e4 *", "Variant": "Chess960"},
+            {"movetext": "1. a8=Q+ *", "FEN": "7k/P7/8/8/8/8/8/7K w - - 0 1"},
+            {"movetext": "1. e4 *", "FEN": "invalid"},
+        ]
+        for row in rows:
+            with self.subTest(row=row):
+                self.assertEqual(is_trainable_game(row), bool(tokenize_game(row, warn=False)))
+        with patch("train.ArtoriaTokenizer", side_effect=AssertionError("Must not tokenize")):
+            self.assertTrue(is_trainable_game(rows[0]))
+
+    def test_filter_removes_bad_games_before_loading_without_warnings(self):
+        dataset = Dataset.from_list([
+            {"movetext": "1. e4 { [%eval 0.2] } e5 *", "Variant": "Standard"},
+            {"movetext": "1. d4 e5 2. dxe5 Nc6 3. Nd3 *", "Variant": "Standard"},
+            {"movetext": "1. e4 *", "Variant": "Chess960"},
+            {"movetext": "1. e4 *", "Variant": "From Position"},
+            {"movetext": "", "Variant": "Standard"},
+            {"movetext": "1. d4 { [%eval 0.3] } d5 *", "Variant": "Standard"},
+        ])
+        with patch("train._LOGGER.warning") as warning, redirect_stdout(io.StringIO()) as output:
+            filtered = filter_training_games(dataset)
+            for row in filtered:
+                self.assertTrue(tokenize_game(row))
+        warning.assert_not_called()
+        self.assertEqual(filtered["movetext"], [dataset[0]["movetext"], dataset[5]["movetext"]])
+        self.assertIn("kept 2 of 6 games (removed 4)", output.getvalue())
+
+    def test_all_invalid_dataset_fails_before_split(self):
+        dataset = Dataset.from_list([{"movetext": "1. e4 e5 2. Bh6 *"}])
+        with patch("train._LOGGER.warning") as warning, redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "at least two valid games"):
+                filter_training_games(dataset)
+        warning.assert_not_called()
+
+    def test_dataset_is_filtered_before_train_validation_split(self):
+        dataset = Dataset.from_list([
+            {"movetext": "1. e4 *"}, {"movetext": "1. e4 e5 2. Bh6 *"},
+            {"movetext": "1. d4 *"},
+        ])
+        with patch("train.load_dataset", return_value=dataset), \
+             patch("train.train_validation_split", side_effect=RuntimeError("reached split")) as split, \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "reached split"):
+                process_dataset("example", 128, 1, 0)
+        selected = split.call_args.args[0]
+        self.assertEqual(len(selected), 2)
+        self.assertTrue(all(is_trainable_game(row) for row in selected))
+
     def test_invalid_game_skipped_whole_and_next_game_preserved(self):
         bad = {"movetext": "1. d4 e5 2. dxe5 Nc6 3. Nd3 *", "GameURL": "bad-game"}
         good = {"movetext": "1. e4 { [%eval 0.25] } e5 { [%eval -0.1] } *"}

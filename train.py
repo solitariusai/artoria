@@ -1,6 +1,7 @@
 import argparse
 import io
 import logging
+import os
 import re
 from typing import Any, TypedDict
 
@@ -70,7 +71,7 @@ def moves_to_fen(data: str, train: bool = False) -> list[PositionEval]:
     return positions
 
 
-def tokenize_game(row: dict[str, Any]) -> list[dict[str, Any]]:
+def tokenize_game(row: dict[str, Any], *, warn: bool = True) -> list[dict[str, Any]]:
     """Emit one encoded game, or skip a malformed/unsupported game with a warning.
 
     Keep every position in valid games. Only finite pawn evaluations contribute
@@ -79,7 +80,8 @@ def tokenize_game(row: dict[str, Any]) -> list[dict[str, Any]]:
     identity = row.get("GameURL") or row.get("Site") or "unknown game"
     variant = row.get("Variant")
     if variant and variant.lower() not in ("standard", "chess", "normal"):
-        _LOGGER.warning("Skipping %s: unsupported variant %s", identity, variant)
+        if warn:
+            _LOGGER.warning("Skipping %s: unsupported variant %s", identity, variant)
         return []
     movetext = row["movetext"]
     if row.get("FEN"):
@@ -92,7 +94,8 @@ def tokenize_game(row: dict[str, Any]) -> list[dict[str, Any]]:
             return []
         tokens = ArtoriaTokenizer().encode([p["fen"] for p in positions])[0]
     except ValueError as error:
-        _LOGGER.warning("Skipping %s: %s; movetext begins %r", identity, error, row["movetext"][:160])
+        if warn:
+            _LOGGER.warning("Skipping %s: %s; movetext begins %r", identity, error, row["movetext"][:160])
         return []
     scores = np.zeros(len(positions), dtype=np.float32)
     score_mask = np.zeros(len(positions), dtype=np.int32)
@@ -102,6 +105,74 @@ def tokenize_game(row: dict[str, Any]) -> list[dict[str, Any]]:
             scores[index] = score
             score_mask[index] = 1
     return [{"fen_ids": tokens, "eval": scores, "eval_mask": score_mask}]
+
+
+class _GameValidator(chess.pgn.BaseVisitor[bool]):
+    """Check SAN legality without building a game tree, FENs, or token arrays."""
+
+    def begin_game(self) -> None:
+        self.mainline_moves = 0
+        self.variation_depth = 0
+
+    def visit_move(self, board: chess.Board, move: chess.Move) -> None:
+        if self.variation_depth == 0:
+            self.mainline_moves += 1
+
+    def visit_board(self, board: chess.Board) -> None:
+        if self.variation_depth == 0:
+            if any(right not in "KQkq-" for right in board.castling_xfen()):
+                raise ValueError("Castling rights cannot be encoded by this tokenizer.")
+            if board.ep_square is not None:
+                expected_rank = 5 if board.turn == chess.WHITE else 2
+                if chess.square_rank(board.ep_square) != expected_rank:
+                    raise ValueError("En passant target has an invalid rank.")
+
+    def begin_variation(self) -> None:
+        self.variation_depth += 1
+
+    def end_variation(self) -> None:
+        self.variation_depth -= 1
+
+    def result(self) -> bool:
+        return self.mainline_moves > 0
+
+
+def is_trainable_game(row: dict[str, Any]) -> bool:
+    """Validate supported PGN quietly without tokenizing every position."""
+    variant = row.get("Variant")
+    if variant and variant.lower() not in ("standard", "chess", "normal"):
+        return False
+    movetext = row["movetext"]
+    if row.get("FEN"):
+        movetext = f'[SetUp "1"]\n[FEN "{row["FEN"]}"]\n\n{movetext}'
+    source = io.StringIO(movetext)
+    has_moves = False
+    try:
+        while (valid := chess.pgn.read_game(source, Visitor=_GameValidator)) is not None:
+            has_moves = has_moves or valid
+    except ValueError:
+        return False
+    return has_moves
+
+
+def filter_training_games(dataset, workers: int = 1):
+    """Remove unsupported, invalid, and empty games before splitting/loading.
+
+    Hugging Face caches the selected indices for datasets backed by cache files,
+    so subsequent runs can reuse the filtering result.
+    """
+    if workers < 1:
+        raise ValueError("Filter workers must be positive.")
+    filtered = dataset.filter(
+        is_trainable_game,
+        num_proc=min(workers, len(dataset)) if workers > 1 and len(dataset) > 1 else None,
+        desc="Filtering valid chess games",
+    )
+    print(f"Dataset filter: kept {len(filtered):,} of {len(dataset):,} games "
+          f"(removed {len(dataset) - len(filtered):,}).")
+    if len(filtered) < 2:
+        raise ValueError("Need at least two valid games for a train/validation split.")
+    return filtered
 
 
 def training_loss(model, batch):
@@ -124,8 +195,9 @@ def training_loss(model, batch):
     eval_loss = jnp.where(eval_mask, eval_loss, 0).sum() / jnp.maximum(eval_mask.sum(), 1)
     return token_loss + 0.1 * eval_loss
 
-def process_dataset(repo: str, max_len: int, batch_size: int, workers: int):
+def process_dataset(repo: str, max_len: int, batch_size: int, workers: int, filter_workers: int = 1):
     ds = load_dataset(repo, split='train')
+    ds = filter_training_games(ds, workers=filter_workers)
     train, val = train_validation_split(ds, 0.01)
 
     train_loader = DataLoader(
@@ -181,6 +253,7 @@ if __name__ == "__main__":
     parser.add_argument('--data-repo', type=str, default='Lichess/tournament-chess-games')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--max-seq-len', type=int, default=128)
+    parser.add_argument('--filter-workers', type=int, default=min(8, os.cpu_count() or 1))
 
     # train
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -199,6 +272,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.loss_chunk_size < 1:
         parser.error('--loss-chunk-size must be positive')
+    if args.filter_workers < 1:
+        parser.error('--filter-workers must be positive')
+
+    # Finish CPU preprocessing before initializing the JAX backend and its threads.
+    train_loader, val_loader = process_dataset(
+        args.data_repo,
+        args.max_seq_len,
+        args.batch_size,
+        args.workers,
+        filter_workers=args.filter_workers,
+    )
 
     mesh = jax.make_mesh(
         (1, jax.device_count()), 
@@ -215,13 +299,6 @@ if __name__ == "__main__":
         'batch': 'data',
         'sequence': None,
     })
-
-    train_loader, val_loader = process_dataset(
-        args.data_repo, 
-        args.max_seq_len, 
-        args.batch_size, 
-        args.workers, 
-    )
 
     config = ArtoriaConfig()
     schedule = optax.cosine_decay_schedule(args.lr, args.max_steps)
