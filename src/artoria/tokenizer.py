@@ -13,11 +13,11 @@ class ArtoriaTokenizer:
     FEN or full six-field FEN; move counters are ignored.
     """
 
-    piece_to_id = {piece: index for index, piece in enumerate("PNBRQKpnbrqk")}
+    piece_to_id = {piece: index for index, piece in enumerate("PNBRQKpnbrqk")}  # noqa: RUF012
     empty_id = 12
-    turn_to_id = {"b": 13, "w": 14}
-    castling_to_id = {False: 15, True: 16}
-    en_passant_to_id = {"-": 17, **{file: 18 + i for i, file in enumerate("abcdefgh")}}
+    turn_to_id = {"b": 13, "w": 14}  # noqa: RUF012
+    castling_to_id = {False: 15, True: 16}  # noqa: RUF012
+    en_passant_to_id = {"-": 17, **{file: 18 + i for i, file in enumerate("abcdefgh")}}  # noqa: RUF012
     vocab_size = 26
     position_length = 70
 
@@ -94,7 +94,7 @@ class ArtoriaTokenizer:
             sequence_length == 0 or any(len(game) != sequence_length for game in games)
         ):
             raise ValueError("Games must have the same nonzero number of positions.")
-        tokens = [[self._encode_position(fen) for fen in game] for game in games]
+        tokens = [[self._encode_position(fen) for fen in game] for game in games]  # ty: ignore[invalid-argument-type]
         if return_list:
             return tokens
         return np.asarray(tokens, dtype=np.int32)

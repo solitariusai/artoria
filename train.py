@@ -18,7 +18,7 @@ from taktiny.trainer import DatasetConfig, Trainer, TrainingConfig
 from taktiny.utils import map_logical_axis_names
 
 from artoria import Artoria, ArtoriaConfig
-from artoria.cache import ArtoriaCache
+from artoria.cache import ArtoriaCache  # noqa: F401
 from artoria.tokenizer import ArtoriaTokenizer
 
 
@@ -70,7 +70,7 @@ def moves_to_fen(data: str, train: bool = False) -> list[PositionEval]:
     return positions
 
 
-def tokenize_game(row: dict[str, Any]) -> list[dict[str, np.ndarray]]:
+def tokenize_game(row: dict[str, Any]) -> list[dict[str, Any]]:
     """Emit one encoded game, or skip a malformed/unsupported game with a warning.
 
     Keep every position in valid games. Only finite pawn evaluations contribute
