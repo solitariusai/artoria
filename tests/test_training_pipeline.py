@@ -53,7 +53,7 @@ class TrainingPipelineTests(unittest.TestCase):
         def model(ids, mask, positions):
             # Only transition 0->1 is a training target; the next game starts at 2.
             logits = jnp.zeros((*ids.shape, 26)).at[:, 1].set(100 * jax.nn.one_hot(ids[:, 1], 26))
-            predictions = jnp.ones((*ids.shape, 1))
+            predictions = jnp.ones((*ids.shape[:2], 1))
             return logits, predictions
 
         batch = {

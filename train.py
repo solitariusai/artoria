@@ -118,8 +118,7 @@ def training_loss(model, batch):
     next_mask = (position_ids[:, 1:] == position_ids[:, :-1] + 1)[..., None]
     token_count = jnp.maximum(next_mask.sum() * fen_ids.shape[-1], 1)
     token_loss = jnp.where(next_mask, token_loss, 0).sum() / token_count
-    # The current model emits an evaluation for each slot; reduce to one per board.
-    predictions = ev_logits.squeeze(-1).mean(axis=-1)
+    predictions = ev_logits.squeeze(-1)
     eval_loss = optax.huber_loss(predictions, batch["eval"], delta=0.3)
     eval_mask = batch["eval_mask"].astype(bool)
     eval_loss = jnp.where(eval_mask, eval_loss, 0).sum() / jnp.maximum(eval_mask.sum(), 1)

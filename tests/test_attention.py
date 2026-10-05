@@ -8,6 +8,7 @@ from taktiny import nn
 from artoria import Artoria, ArtoriaConfig
 from artoria.impl import ArtoriaAttention
 from artoria.rope import ArtoriaRoPE
+from artoria.cache import ArtoriaCache
 from taktiny.utils.trainer import _combine_params, _parameter_labels, _partition_params
 from train import training_loss
 
@@ -35,7 +36,7 @@ class AttentionShapeTests(unittest.TestCase):
         mask = jnp.tril(segments[:, :, None] == segments[:, None, :])[:, None]
         batched = jax.jit(lambda i, m, p: model(i, m, p))(ids, mask, positions)
         self.assertEqual(batched[0].shape, (2, 4, 70, 26))
-        self.assertEqual(batched[1].shape, (2, 4, 70, 1))
+        self.assertEqual(batched[1].shape, (2, 4, 1))
         for game in range(2):
             single = model(ids[game:game + 1], mask[game:game + 1], positions[game:game + 1])
             for actual, expected in zip(batched, single):
@@ -72,6 +73,18 @@ class AttentionShapeTests(unittest.TestCase):
             self.assertTrue(np.isfinite(np.asarray(leaf)).all())
         self.assertGreater(float(jnp.linalg.norm(gradients.ranks.value)), 0)
         self.assertGreater(float(jnp.linalg.norm(gradients.files.value)), 0)
+
+    def test_pooled_temporal_cache_matches_full_causal_forward(self):
+        model = Artoria(self.config, rngs=nn.Rngs(3))
+        ids = jnp.arange(2 * 4 * 70).reshape(2, 4, 70) % 26
+        full_logits, full_eval = model(ids)
+        cache = ArtoriaCache(self.config, num_batches=2, max_sequences=4)
+        first = model(ids[:, :2], cache=cache)
+        second = model(ids[:, 2:], cache=cache)
+        for expected, before, after in zip((full_logits, full_eval), first, second):
+            actual = jnp.concatenate((before, after), axis=1)
+            np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+        self.assertEqual(int(cache.position_idx[...]), 4)
 
 
 if __name__ == "__main__":

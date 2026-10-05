@@ -104,14 +104,27 @@ class ArtoriaMLP(nn.Module):
         x1, x2 = jnp.split(x, 2, -1)
         return self.down_proj(jax.nn.silu(x1) * x2)
 
-class ArtoriaDecoder(nn.Module):
+class ArtoriaSpatialEncoder(nn.Module):
+    """Mix squares and metadata within each board, independently of time."""
+
     def __init__(self, config: ArtoriaConfig, *, rngs: nn.Rngs):
-        self.attn1 = ArtoriaAttention(config, rngs=rngs)
-        self.attn2 = ArtoriaAttention(config, rngs=rngs)
+        self.attn = ArtoriaAttention(config, rngs=rngs)
         self.mlp = ArtoriaMLP(config, rngs=rngs)
         self.norm1 = nn.RMSNorm(config.d_model, config.epsilon, dtype='float32', axis_names=('embed',))
         self.norm2 = nn.RMSNorm(config.d_model, config.epsilon, dtype='float32', axis_names=('embed',))
-        self.norm3 = nn.RMSNorm(config.d_model, config.epsilon, dtype='float32', axis_names=('embed',))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = self.attn(self.norm1(x)) + x
+        return self.mlp(self.norm2(x)) + x
+
+
+class ArtoriaDecoder(nn.Module):
+    """Causal attention over one pooled vector per game position."""
+    def __init__(self, config: ArtoriaConfig, *, rngs: nn.Rngs):
+        self.attn = ArtoriaAttention(config, rngs=rngs)
+        self.mlp = ArtoriaMLP(config, rngs=rngs)
+        self.norm1 = nn.RMSNorm(config.d_model, config.epsilon, dtype='float32', axis_names=('embed',))
+        self.norm2 = nn.RMSNorm(config.d_model, config.epsilon, dtype='float32', axis_names=('embed',))
 
     def __call__(
         self, 
@@ -121,42 +134,31 @@ class ArtoriaDecoder(nn.Module):
         cache: ArtoriaCache | None = None,
         layer_idx: jax.Array | int | None = None
     ):
-        B, T, S, C = x.shape
-        x = x.reshape(B * T, S, C)
-        x = self.attn1(self.norm1(x)) + x
-
-        x = x.reshape(B, T, S, C)
-        x = x.transpose(0, 2, 1, 3)
-
-        x = x.reshape(B * S, T, C)
-        temporal_mask = mask
-        if temporal_mask is not None:
-            if temporal_mask.ndim == 3:
-                temporal_mask = temporal_mask[:, None, :, :]
-            if temporal_mask.ndim == 4 and temporal_mask.shape[0] == B:
-                # Flattened order is game 0's S slots, then game 1's S slots.
-                temporal_mask = jnp.repeat(temporal_mask, S, axis=0)
-        x = self.attn2(self.norm2(x), temporal_mask, position_embedding, cache, layer_idx) + x
-
-        x = x.reshape(B, S, T, C)
-        x = x.transpose(0, 2, 1, 3)
-        x = self.mlp(self.norm3(x)) + x
-        return x
+        x = self.attn(self.norm1(x), mask, position_embedding, cache, layer_idx) + x
+        return self.mlp(self.norm2(x)) + x
 
 class Artoria(nn.Module):
+    """Spatial board encoding -> mean pooling -> temporal game decoding.
+
+    Token logits are [B, T, 70, vocab]; pawn evaluations are [B, T, 1].
+    """
     def __init__(self, config: ArtoriaConfig, *, rngs: nn.Rngs):
         self.wte = nn.Embedding(config.vocab, config.d_model, dtype=config.dtype, rngs=rngs, axis_names=('vocab', 'embed'))
+        self.spatial_layers = nn.List([
+            ArtoriaSpatialEncoder(config, rngs=rngs) for _ in range(config.n_spatial_layers)
+        ])
         self.layers = nn.List([
             nn.SeqStack([ArtoriaDecoder(config, rngs=rngs) for _ in range(config.n_parallel)])
             for _ in range(config.n_depth)
         ])
         self.norm = nn.RMSNorm(config.d_model, config.epsilon, dtype='float32', axis_names=('embed',))
         self.eval_norm = nn.RMSNorm(config.d_model, config.epsilon, dtype='float32', axis_names=('embed',))
-        self.head = nn.Linear(config.d_model, config.vocab, bias=False, dtype=config.dtype, rngs=rngs, axis_names=('embed', 'vocab'))
+        self.head = nn.Linear(config.d_model, (70, config.vocab), bias=False, dtype=config.dtype, rngs=rngs, axis_names=('embed', 'slot', 'vocab'))
         self.eval_head = nn.Linear(config.d_model, 1, bias=True, dtype='float32', rngs=rngs, axis_names=('embed', 'eval'))
         self.rope = ArtoriaRoPE(config.head_dim)
         self.files = nn.Parameter( 0.02 * jax.random.normal(rngs(), (8, config.d_model)))
         self.ranks = nn.Parameter( 0.02 * jax.random.normal(rngs(), (8, config.d_model)))
+        self.metadata_positions = nn.Parameter(0.02 * jax.random.normal(rngs(), (6, config.d_model)))
         self.k = config.n_parallel
 
     def __call__(
@@ -167,7 +169,10 @@ class Artoria(nn.Module):
         cache: ArtoriaCache | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         # ids: [B, T, 70] -> [B, T, 70, C]
+        if ids.ndim != 3 or ids.shape[-1] != 70:
+            raise ValueError('ids must have shape [batch, sequence, 70]')
         x = jax.checkpoint(self.wte)(ids)
+        B, T, S, C = x.shape
         if position_ids is None:
             if cache is not None:
                 start_idx = cache.position_idx[...]
@@ -180,7 +185,16 @@ class Artoria(nn.Module):
         layer_idx = jnp.asarray(0, dtype='uint32')
 
         coord = (self.ranks[:, None, :] + self.files[None, :, :]).reshape(64, -1)
-        x = x.at[..., :64, :].add(coord.astype(x.dtype))
+        slot_positions = jnp.concatenate((coord, self.metadata_positions.value), axis=0)
+        x = x + slot_positions.astype(x.dtype)[None, None]
+        x = x.reshape(B * T, S, C)
+        for spatial_layer in self.spatial_layers:
+            x = spatial_layer(x)
+        x = x.mean(axis=1).reshape(B, T, C)
+        if mask is None and cache is None:
+            mask = jnp.tril(jnp.ones((T, T), dtype=bool))[None, None]
+        elif mask is not None and mask.ndim == 3:
+            mask = mask[:, None]
         def fwd_layer(layer, carry, z):
             x, layer_idx = carry
             x = jax.checkpoint(layer)(z, mask, position_embedding, cache, layer_idx) + x
