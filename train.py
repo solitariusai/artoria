@@ -21,7 +21,7 @@ from taktiny.utils import map_logical_axis_names
 from artoria import Artoria, ArtoriaConfig
 from artoria.cache import ArtoriaCache  # noqa: F401
 from artoria.tokenizer import ArtoriaTokenizer
-from artoria.moves import move_to_id
+from artoria.moves import MOVE_TO_ID, move_to_id
 
 
 class PositionEval(TypedDict):
@@ -37,7 +37,18 @@ _EVAL_PATTERN = re.compile(
 _LOGGER = logging.getLogger(__name__)
 
 
+def _validate_training_move(move: chess.Move) -> None:
+    if not move:
+        raise ValueError('Null move (0000) is not a legal standard-chess action.')
+    if move.uci() not in MOVE_TO_ID:
+        raise ValueError(f'Unsupported training move: {move.uci()}')
+
+
 class _StrictGameBuilder(chess.pgn.GameBuilder):
+    def visit_move(self, board: chess.Board, move: chess.Move) -> None:
+        _validate_training_move(move)
+        super().visit_move(board, move)
+
     def handle_error(self, error: Exception) -> None:
         raise ValueError(f"Invalid PGN: {error}") from error
 
@@ -140,6 +151,7 @@ class _GameValidator(chess.pgn.BaseVisitor[bool]):
         self.variation_depth = 0
 
     def visit_move(self, board: chess.Board, move: chess.Move) -> None:
+        _validate_training_move(move)
         if self.variation_depth == 0:
             self.mainline_moves += 1
 
@@ -163,7 +175,7 @@ class _GameValidator(chess.pgn.BaseVisitor[bool]):
 
 
 def is_trainable_game(row: dict[str, Any]) -> bool:
-    """Validate supported PGN quietly without tokenizing every position."""
+    """Validate supported PGN, rejecting null/unsupported policy moves quietly."""
     variant = row.get("Variant")
     if variant and variant.lower() not in ("standard", "chess", "normal"):
         return False

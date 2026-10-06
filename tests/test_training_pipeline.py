@@ -25,12 +25,27 @@ class TrainingPipelineTests(unittest.TestCase):
             {"movetext": "1. e4 *", "Variant": "Chess960"},
             {"movetext": "1. a8=Q+ *", "FEN": "7k/P7/8/8/8/8/8/7K w - - 0 1"},
             {"movetext": "1. e4 *", "FEN": "invalid"},
+            {'movetext': '1. e4 -- 2. Nf3 *'},
+            {'movetext': '1. e4 0000 2. Nf3 *'},
+            {'movetext': '1. -- e5 *'},
+            {'movetext': '1. e4 (1. --) e5 *'},
         ]
         for row in rows:
             with self.subTest(row=row):
                 self.assertEqual(is_trainable_game(row), bool(tokenize_game(row, warn=False)))
         with patch("train.ArtoriaTokenizer", side_effect=AssertionError("Must not tokenize")):
             self.assertTrue(is_trainable_game(rows[0]))
+
+    def test_null_move_record_is_filtered_and_skipped_without_key_error(self):
+        bad = {'movetext': '1. e4 -- 2. Nf3 *', 'GameURL': 'null-move-game'}
+        self.assertFalse(is_trainable_game(bad))
+        with self.assertLogs('train', level='WARNING') as logs:
+            self.assertEqual(tokenize_game(bad), [])
+        self.assertIn('Null move (0000)', logs.output[0])
+        good = {'movetext': '1. d4 d5 *'}
+        games = tokenize_game(good)
+        self.assertEqual(len(games), 1)
+        self.assertEqual(games[0]['policy_ids'][0], move_to_id('d2d4'))
 
     def test_filter_removes_bad_games_before_loading_without_warnings(self):
         dataset = Dataset.from_list([
@@ -100,6 +115,7 @@ class TrainingPipelineTests(unittest.TestCase):
         rows = [
             {"movetext": "1. e4 { [%eval 0.2] } e5 { [%eval -0.1] } *"},
             {"movetext": "1. e4 e5 2. Bh6 *"},
+            {'movetext': '1. e4 0000 2. Nf3 *'},
             {"movetext": "1. d4 { [%eval 0.3] } d5 2. c4 { [%eval #2] } *"},
         ]
         loader = DataLoader(rows, operations=[
