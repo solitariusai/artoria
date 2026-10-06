@@ -11,6 +11,7 @@ class ArtoriaConfig:
     n_parallel: int = 6
     n_depth: int = 4
     n_spatial_layers: int = 4
+    spatial_chunk_size: int = 64  # Target boards/group; minimum one timestep per batch.
     epsilon: float = 1e-7
     n_heads: int = 8
     n_kv_heads: int = 8

@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -88,6 +89,26 @@ class AttentionShapeTests(unittest.TestCase):
             actual = jnp.concatenate((before, after), axis=1)
             np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
         self.assertEqual(int(cache.position_idx[...]), 4)
+
+    def test_spatial_groups_match_full_outputs_and_gradients_with_padding(self):
+        # B=2,T=5 and four boards/group leaves a padded final time group.
+        chunked = Artoria(replace(self.config, spatial_chunk_size=4), rngs=nn.Rngs(8))
+        full = Artoria(replace(self.config, spatial_chunk_size=1000), rngs=nn.Rngs(8))
+        ids = jnp.arange(2 * 5 * 70).reshape(2, 5, 70) % 26
+        batch = {
+            'fen_ids': ids, 'position_ids': jnp.tile(jnp.arange(5), (2, 1)),
+            'eval': jnp.ones((2, 5)), 'eval_mask': jnp.ones((2, 5), dtype=jnp.int32),
+            'policy_ids': jnp.zeros((2, 5), dtype=jnp.int32),
+            'policy_mask': jnp.ones((2, 5), dtype=jnp.int32),
+        }
+        for expected, actual in zip(full(ids), chunked(ids)):
+            np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+        loss_and_grad = jax.jit(jax.value_and_grad(training_loss))
+        full_loss, full_grad = loss_and_grad(full, batch)
+        chunk_loss, chunk_grad = loss_and_grad(chunked, batch)
+        np.testing.assert_allclose(chunk_loss, full_loss, rtol=2e-5, atol=2e-5)
+        for expected, actual in zip(jax.tree.leaves(full_grad), jax.tree.leaves(chunk_grad)):
+            np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=3e-6)
 
 
 if __name__ == "__main__":

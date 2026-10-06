@@ -144,6 +144,9 @@ class Artoria(nn.Module):
     and next-move policy logits [B,T,n_moves].
     """
     def __init__(self, config: ArtoriaConfig, *, rngs: nn.Rngs):
+        if config.spatial_chunk_size < 1:
+            raise ValueError('spatial_chunk_size must be positive')
+        self.spatial_chunk_size = config.spatial_chunk_size
         self.wte = nn.Embedding(config.vocab, config.d_model, dtype=config.dtype, rngs=rngs, axis_names=('vocab', 'embed'))
         self.spatial_layers = nn.List([
             ArtoriaSpatialEncoder(config, rngs=rngs) for _ in range(config.n_spatial_layers)
@@ -173,26 +176,41 @@ class Artoria(nn.Module):
         # ids: [B, T, 70] -> [B, T, 70, C]
         if ids.ndim != 3 or ids.shape[-1] != 70:
             raise ValueError('ids must have shape [batch, sequence, 70]')
-        x = jax.checkpoint(self.wte)(ids)
-        B, T, S, C = x.shape
+        B, T, S = ids.shape
         if position_ids is None:
             if cache is not None:
                 start_idx = cache.position_idx[...]
             else:
                 start_idx = 0
 
-            position_ids = start_idx + jnp.arange(x.shape[1])
+            position_ids = start_idx + jnp.arange(T)
 
         position_embedding = self.rope(position_ids)
         layer_idx = jnp.asarray(0, dtype='uint32')
 
         coord = (self.ranks[:, None, :] + self.files[None, :, :]).reshape(64, -1)
         slot_positions = jnp.concatenate((coord, self.metadata_positions.value), axis=0)
-        x = x + slot_positions.astype(x.dtype)[None, None]
-        x = x.reshape(B * T, S, C)
-        for spatial_layer in self.spatial_layers:
-            x = jax.checkpoint(spatial_layer)(x)
-        x = x.mean(axis=1).reshape(B, T, C)
+        # Boards have no interactions until temporal decoding. Embed, encode,
+        # and pool each group before moving on, so spatial intermediates scale
+        # with chunk_size rather than batch * sequence. Rematerialize the whole
+        # group for backward; retain only IDs and pooled vectors between groups.
+        # Group along time and keep the full batch axis inside each group.
+        # This preserves data-parallel batch sharding instead of scanning over
+        # a sharded batch axis and replicating work across accelerators.
+        chunk_time = min(T, max(1, self.spatial_chunk_size // B))
+        padding = (-T) % chunk_time
+        boards = jnp.pad(ids, ((0, 0), (0, padding), (0, 0)), mode='edge')
+        boards = boards.reshape(B, -1, chunk_time, S).transpose(1, 0, 2, 3)
+
+        def encode_boards(board_ids):
+            hidden = self.wte(board_ids.reshape(B * chunk_time, S))
+            hidden = hidden + slot_positions.astype(hidden.dtype)[None]
+            for spatial_layer in self.spatial_layers:
+                hidden = spatial_layer(hidden)
+            return hidden.mean(axis=1).reshape(B, chunk_time, -1)
+
+        pooled = jax.lax.map(jax.checkpoint(encode_boards), boards)
+        x = pooled.transpose(1, 0, 2, 3).reshape(B, T + padding, -1)[:, :T]
         if mask is None and cache is None:
             mask = jnp.tril(jnp.ones((T, T), dtype=bool))[None, None]
         elif mask is not None and mask.ndim == 3:
